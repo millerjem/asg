@@ -1,0 +1,256 @@
+locals {
+  worker_security_group              = [aws_security_group.konvoy_private.id, aws_security_group.konvoy_ssh.id, aws_security_group.konvoy_egress.id]
+  worker_security_group_with_bastion = [aws_security_group.konvoy_private.id, aws_security_group.konvoy_egress.id]
+}
+
+{{ range $workerPool := .WorkerPools}}
+locals {
+  worker{{$workerPool.Index}}_subnet_ids = length(var.worker_pool{{$workerPool.Index}}_subnet_ids) == 0 ? aws_subnet.konvoy_private.*.id : var.worker_pool{{$workerPool.Index}}_subnet_ids
+
+  // Determine the instance profile name. This is the priority:
+  // 1. Instance profile name specified by the user
+  // 2. Instance profile ARN specified by the user
+  // 3. If non of the above is specified, use konvoy generated
+  worker_pool{{$workerPool.Index}}_instance_profile_name_from_arn = replace(var.worker_pool{{$workerPool.Index}}_iam_instance_profile_arn, "/.*instance-profile//", "")
+  worker_pool{{$workerPool.Index}}_instance_profile = coalesce(var.worker_pool{{$workerPool.Index}}_iam_instance_profile_name, local.worker_pool{{$workerPool.Index}}_instance_profile_name_from_arn, join("", aws_iam_instance_profile.node_profile.*.id))
+}
+
+variable "worker_pool{{$workerPool.Index}}_name" {
+  description = "The name for worker pool {{$workerPool.Index}}"
+  default     = "worker{{$workerPool.Index}}"
+}
+
+variable "worker_pool{{$workerPool.Index}}_count" {
+  description = "Number of k8s nodes for worker pool {{$workerPool.Index}}"
+  default     = 0
+}
+
+variable "worker_pool{{$workerPool.Index}}_instance_type" {
+  description = "[WORKER POOL {{$workerPool.Index}}] Instance type"
+  default     = "m5.2xlarge"
+}
+
+variable "worker_pool{{$workerPool.Index}}_image_id" {
+  description = "[WORKER POOL {{$workerPool.Index}}] AWS AMI image ID that will be used for the instances instead of the Mesosphere chosen default images"
+  default     = ""
+}
+
+variable "worker_pool{{$workerPool.Index}}_root_volume_size" {
+  description = "[WORKER POOL {{$workerPool.Index}}] The root volume size"
+  default     = "80"
+}
+
+variable "worker_pool{{$workerPool.Index}}_root_volume_type" {
+  description = "[WORKER POOL {{$workerPool.Index}}] The root volume type"
+  default     = ""
+}
+
+variable "worker_pool{{$workerPool.Index}}_imagefs_volume_enabled" {
+  description = "[WORKER POOL {{$workerPool.Index}}] Whether to have dedicated volume for imagefs"
+  default     = false
+}
+
+variable "worker_pool{{$workerPool.Index}}_imagefs_volume_size" {
+  description = "[WORKER POOL {{$workerPool.Index}}] The size for the dedicated imagefs volume"
+  default     = "160"
+}
+
+variable "worker_pool{{$workerPool.Index}}_imagefs_volume_type" {
+  description = "[WORKER POOL {{$workerPool.Index}}] The type for the dedicated imagefs volume. Should be gp2 or io1"
+  default     = "gp2"
+}
+
+variable "worker_pool{{$workerPool.Index}}_imagefs_volume_device" {
+  description = "[WORKER POOL {{$workerPool.Index}}] The device to mount the volume at."
+  default     = "xvdb"
+}
+
+variable "worker_pool{{$workerPool.Index}}_associate_public_ip_address" {
+  description = "[WORKER POOL {{$workerPool.Index}}] Used to disable public IP association"
+  default     = true
+}
+
+variable "worker_pool{{$workerPool.Index}}_subnet_ids" {
+  type        = list
+  description = "[WORKER POOL {{$workerPool.Index}}] Subnets to be used to deploy workers"
+  default     = []
+}
+
+variable "worker_pool{{$workerPool.Index}}_iam_instance_profile_name" {
+  description = "Pre-existing iam instanceProfile name to use"
+  default     = ""
+}
+
+variable "worker_pool{{$workerPool.Index}}_iam_instance_profile_arn" {
+  description = "Pre-existing iam instanceProfile ARN to use"
+  default     = ""
+}
+
+resource "aws_instance" "worker_pool{{$workerPool.Index}}" {
+  vpc_security_group_ids = var.bastion_pool_count > 0 ? local.worker_security_group_with_bastion : local.worker_security_group
+  subnet_id              = element(local.worker{{$workerPool.Index}}_subnet_ids, count.index % length(local.worker{{$workerPool.Index}}_subnet_ids))
+  key_name               = local.cluster_name
+  count                  = var.worker_pool{{$workerPool.Index}}_count
+  ami                    = var.worker_pool{{$workerPool.Index}}_image_id
+  instance_type          = var.worker_pool{{$workerPool.Index}}_instance_type
+  availability_zone      = element(coalescelist(var.aws_availability_zones, data.aws_availability_zones.available.names), count.index)
+  iam_instance_profile   = local.worker_pool{{$workerPool.Index}}_instance_profile
+  source_dest_check      = "false"
+  associate_public_ip_address = var.bastion_pool_count > 0 ? false : var.worker_pool{{$workerPool.Index}}_associate_public_ip_address
+
+  root_block_device {
+    volume_size           = var.worker_pool{{$workerPool.Index}}_root_volume_size
+    volume_type           = var.worker_pool{{$workerPool.Index}}_root_volume_type
+    delete_on_termination = true
+  }
+
+  tags = merge(
+    local.common_tags,
+    map(
+      "Name", "${local.cluster_name}-${var.worker_pool{{$workerPool.Index}}_name}-${count.index}",
+      "konvoy/nodeRoles", "worker"
+    )
+  )
+
+  volume_tags = merge(
+    local.common_tags_no_cluster,
+    map(
+      "konvoy/nodeRoles", "worker"
+    )
+  )
+
+  lifecycle {
+    ignore_changes = [
+      volume_tags,
+    ]
+  }
+}
+
+resource "aws_ebs_volume" "worker_pool{{$workerPool.Index}}_imagefs" {
+  count             = var.worker_pool{{$workerPool.Index}}_imagefs_volume_enabled ? var.worker_pool{{$workerPool.Index}}_count : 0
+  availability_zone = element(aws_instance.worker_pool{{$workerPool.Index}}.*.availability_zone, count.index)
+  type              = var.worker_pool{{$workerPool.Index}}_imagefs_volume_type
+  size              = var.worker_pool{{$workerPool.Index}}_imagefs_volume_size
+
+  tags = merge(
+    local.common_tags_no_cluster,
+    map(
+      "Name", "${local.cluster_name}-worker-pool-{{$workerPool.Index}}-volume-imagefs-${count.index}",
+      "konvoy/nodeRoles", "worker"
+    )
+  )
+}
+
+resource "aws_volume_attachment" "worker_pool{{$workerPool.Index}}_imagefs" {
+  count        = var.worker_pool{{$workerPool.Index}}_imagefs_volume_enabled ? var.worker_pool{{$workerPool.Index}}_count : 0
+  device_name  = "/dev/${var.worker_pool{{$workerPool.Index}}_imagefs_volume_device}"
+  volume_id    = element(aws_ebs_volume.worker_pool{{$workerPool.Index}}_imagefs.*.id, count.index)
+  instance_id  = element(aws_instance.worker_pool{{$workerPool.Index}}.*.id, count.index)
+  force_detach = true
+
+  lifecycle {
+    ignore_changes = [instance_id]
+  }
+}
+
+#resource "aws_ami_from_instance" "konvoy-asg-ami" {
+#  name               = "asg-ami-$var.konvoy_version"
+#  source_instance_id = "$aws_instance.worker_pool[0].id"
+#  snapshot_without_reboot = true
+#}
+
+resource "aws_launch_configuration" "konvoy-asg-launch-configuration" {
+
+  name_prefix = "konvoy-asg"
+  associate_public_ip_address = false
+  image_id = "ami-01bb86febe947a11c"
+  security_groups = [aws_security_group.konvoy_private.id, aws_security_group.konvoy_egress.id, aws_security_group.konvoy_ssh.id]
+  iam_instance_profile = aws_iam_instance_profile.node_profile[0].name
+  instance_type = "m5.xlarge"
+  lifecycle {
+    create_before_destroy = true
+  }
+ # data "template_file" "add-node" {
+ # template = file("add.tpl")
+
+ # user_data = <<-USERDATA
+ # #!/bin/bash
+ # cat <<"__EOF__" > /home/centos/setup.sh
+ # __EOF__
+ # chmod a+x /home/centos/setup.sh
+ # kubeadm join $aws_loa --config=/etc/kubernetes/kubeadm-config.yaml
+ # USERDATA
+}
+
+#locals {
+#    asg_tags = "${map(
+#      "Name", "konvoy-asg",
+#      "k8s.io/cluster-autoscaler/enabled", "true",
+#      "k8s.io/cluster-autoscaler/${local.cluster_name}", "owned"
+#    )}"
+#  }
+
+resource "aws_autoscaling_group" "konvoy-asg" {
+  name = "konvoy-asg"
+  #availability_zones = var.aws_availability_zones
+  desired_capacity   = 0
+  max_size           = 2
+  min_size           = 0
+  vpc_zone_identifier = [aws_subnet.konvoy_private[0].id]
+
+  launch_configuration = aws_launch_configuration.konvoy-asg-launch-configuration.name
+    
+  #launch_template {
+  #  id      = aws_launch_template.konvoy-asg-launch-configuration.id
+  #  version = aws_launch_template.konvoy-asg-launch-configuration.latest_version
+  #}
+
+  tag {
+    key = "Name"
+    value = "konvoy-asg"
+    propagate_at_launch = "true"
+  }
+
+  tag {
+    key = "k8s.io/cluster-autoscaler/enabled"
+    value = "true"
+    propagate_at_launch = "true"
+  }
+
+  tag {
+    key = "k8s.io/cluster-autoscaler/${local.cluster_name}"
+    value = "owned"
+    propagate_at_launch = "true"
+  }
+  
+  #tags = concat(
+  #  [
+  #    {
+  #      "key" = "Name"
+  #      "value" = "${local.cluster_name}-asg"
+  #      "propagate_at_launch" = true
+  #    },
+  #    {
+  #      "key" = "k8s.io/cluster-autoscaler/enabled"
+  #      "value" = "true"
+  #      "propagate_at_launch" = true
+  #    },
+  #    {
+  #     "key" = "k8s.io/cluster-autoscaler/${local.cluster_name}-asg"
+  #      "value" = "owned"
+  #      "propagate_at_launch" = true
+  #    },
+  #  ]
+  #)
+
+  #instance_refresh {
+  #  strategy = "Rolling"
+  #  preferences {
+  #    min_healthy_percentage = 50
+  #    }
+  #    triggers = ["tag", "launch_template"]
+  #}
+}
+
+
+{{ end }}
